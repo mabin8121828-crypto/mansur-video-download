@@ -19,7 +19,7 @@ import struct
 import subprocess
 import sys
 import tempfile
-from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parent
@@ -36,8 +36,26 @@ class WorkflowError(RuntimeError):
 
 def safe_error(value: str) -> str:
     value = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[redacted]", value)
-    value = re.sub(r"(?i)(cookie|authorization)(\s*[:=]\s*)[^\r\n]+", r"\1\2[redacted]", value)
+    value = re.sub(r'''(?i)["']?(cookie|authorization|token|signature|credential)["']?(\s*[:=]\s*)[^\r\n]+''',
+                   r"\1\2[redacted]", value)
     return value[-3000:]
+
+
+def public_url(url: str) -> str:
+    parts = urlsplit(url)
+    public_keys = ({"v", "list", "index", "start_radio"} if (parts.hostname or "").lower()
+                   in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"} else set())
+    query = urlencode([(key, value if key in public_keys else "[redacted]")
+                       for key, value in parse_qsl(parts.query, keep_blank_values=True)])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def find_tool(name: str) -> str:
@@ -257,18 +275,54 @@ def safe_stem(value: str) -> str:
     return stem
 
 
+def validate_metadata(info: dict, metadata: dict) -> None:
+    expected = metadata.get("duration")
+    if expected is not None:
+        duration = float(expected)
+        if math.isfinite(duration) and duration > 0 and abs(info["duration_seconds"] - duration) > max(2.0, duration * .02):
+            raise WorkflowError("verify", "Video duration does not match the platform metadata; existing files left untouched")
+    width, height = metadata.get("width"), metadata.get("height")
+    if width and height and min(info["width"], info["height"]) + 1 < min(width, height):
+        raise WorkflowError("verify", "Existing or downloaded video is below the requested resolution; use a new output directory")
+
+
+def read_provenance(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise WorkflowError("publish", "Cannot read the existing source fingerprint") from exc
+    if not isinstance(payload, dict):
+        raise WorkflowError("publish", "Invalid source fingerprint record")
+    return payload
+
+
 def prepare_video(source: Path, output: Path, stem: str, tools: Tools, work: Path, timeout: int) -> dict:
     stem = safe_stem(stem)
     target = output / f"{stem}.mp4"
+    provenance = output / f"{stem}.source.json"
     source_info = probe(source, tools, work)
     with download_lock(output, "file:" + (target.name.casefold() if os.name == "nt" else target.name)):
         if target.exists():
             info = verify(target, tools, work, timeout)
+            if source.resolve() != target.resolve():
+                if not provenance.is_file():
+                    raise WorkflowError("publish", "Existing file has no source fingerprint; use a different name or directory")
+                stored = read_provenance(provenance)
+                if (stored.get("source_sha256") != file_sha256(source)
+                        or stored.get("file_sha256") != file_sha256(target)):
+                    raise WorkflowError("publish", "Same output name conflicts with a different source or changed file; existing file left untouched")
+            elif provenance.is_file():
+                stored = read_provenance(provenance)
+                if stored.get("file_sha256") != file_sha256(target):
+                    raise WorkflowError("publish", "Existing file no longer matches its saved fingerprint")
             tolerance = max(2.0, source_info["duration_seconds"] * .02)
             if abs(info["duration_seconds"] - source_info["duration_seconds"]) > tolerance:
                 raise WorkflowError("publish", "Existing output has a different duration; left untouched")
             return {**info, "reused": True, "converted": False}
         pending = work / f"ready_{stem}.mp4"
+        source_digest = file_sha256(source)
+        if provenance.exists():
+            raise WorkflowError("publish", "Source record already exists without its video; use a different name or directory")
         video_copy = source_info["video_codec"] == "h264" and source_info["pixel_format"] == "yuv420p"
         command = [tools.ffmpeg, "-nostdin", "-v", "error", "-n", "-i", str(source),
                    "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0"]
@@ -286,8 +340,10 @@ def prepare_video(source: Path, output: Path, stem: str, tools: Tools, work: Pat
             raise WorkflowError("verify", "Converted duration differs from the source")
         # Same-volume hard links publish atomically without replacing existing files.
         os.link(pending, target)
+        fingerprints = {"source_sha256": source_digest, "file_sha256": file_sha256(target)}
+        write_json_exclusive(provenance, fingerprints)
         return {**info, "path": str(target.resolve()), "reused": False,
-                "converted": not compatible(source_info)}
+                "converted": not compatible(source_info), **fingerprints}
 
 
 def cleanup_job(work: Path, output: Path) -> None:
@@ -343,8 +399,11 @@ def download_ytdlp(url: str, prefix: str, args, tools: Tools, work: Path, attemp
     last_error = "No extraction strategy available"
     for label, cookies, browser in cookie_strategies(args, prefix, work):
         base = ytdlp_base(tools, args, cookies, browser)
+        selection = ["-f", args.format or "bestvideo+bestaudio/best"]
+        if not args.format:
+            selection += ["--format-sort", quality_sort(args.max_height)]
         try:
-            metadata = json.loads(run(base + ["--dump-single-json", "--skip-download", url],
+            metadata = json.loads(run(base + selection + ["--dump-single-json", "--skip-download", url],
                                       "metadata", work, min(args.timeout, 120)))
             if not isinstance(metadata, dict) or not metadata_items(metadata) or any(
                     not item.get("id") for item in metadata_items(metadata)):
@@ -356,26 +415,32 @@ def download_ytdlp(url: str, prefix: str, args, tools: Tools, work: Path, attemp
             continue
         expected = [Path(args.output_dir).resolve() / f"{safe_stem(prefix + '_' + str(item['id']))}.mp4"
                     for item in metadata_items(metadata)]
-        if all(p.is_file() for p in expected):
+        cached = all(p.is_file() for p in expected)
+        if cached and not args.extras:
             attempts.append({"strategy": "existing-output", "stage": "download", "ok": True})
             return expected, metadata
         paths = work / "final_paths.jsonl"
         paths.unlink(missing_ok=True)
-        command = base + ["--merge-output-format", "mp4", "-f", args.format or "bestvideo+bestaudio/best",
+        command = base + selection + ["--merge-output-format", "mp4",
             "--paths", str(work), "-o", f"{prefix}_%(id)s.%(ext)s",
             "--print-to-file", "after_move:%(filepath)j", str(paths)]
-        if not args.format:
-            command += ["--format-sort", quality_sort(args.max_height)]
+        if cached:
+            command += ["--skip-download"]
         if args.extras:
             command += ["--write-thumbnail", "--convert-thumbnails", "jpg", "--write-subs", "--write-auto-subs",
                         "--sub-langs", "all,-live_chat", "--embed-metadata"]
         try:
-            run(command + [url], "download", work, args.timeout)
-            files = list(dict.fromkeys(Path(json.loads(line)).resolve() for line in
-                paths.read_text(encoding="utf-8").splitlines() if line.strip())) if paths.exists() else []
-            if not files or any(not p.is_file() or not p.is_relative_to(work.resolve()) for p in files):
+            run(command + [url], "attachments" if cached else "download", work, args.timeout)
+            if cached:
+                files = expected
+            elif paths.exists():
+                files = list(dict.fromkeys(Path(json.loads(line)).resolve() for line in
+                    paths.read_text(encoding="utf-8").splitlines() if line.strip()))
+            else:
+                files = []
+            if not files or any(not p.is_file() or (not cached and not p.is_relative_to(work.resolve())) for p in files):
                 raise WorkflowError("download", "Downloader returned no final video file")
-            attempts.append({"strategy": label, "stage": "download", "ok": True})
+            attempts.append({"strategy": label, "stage": "attachments" if cached else "download", "ok": True})
             return files, metadata
         except (WorkflowError, json.JSONDecodeError) as exc:
             last_error = safe_error(str(exc))
@@ -459,7 +524,7 @@ def execute_job(args, tools: Tools) -> dict:
             prefix = platform_prefix(normalized)
             # Preserve playlist parameters only when the user requested a playlist.
             url = args.url.strip() if args.playlist else normalized
-            report["source_url"] = normalized
+            report["source_url"] = public_url(normalized)
             with download_lock(output, "url:" + url):
                 try:
                     files, metadata = download_ytdlp(url, prefix, args, tools, work, report["attempts"])
@@ -472,14 +537,16 @@ def execute_job(args, tools: Tools) -> dict:
                     files, metadata = download_short_video(url, args, work, report["attempts"])
                 items = metadata_items(metadata) if metadata else []
                 for source in files:
-                    matching = next((item for item in items if source.stem == f"{prefix}_{item.get('id')}"), {})
+                    matching = next((item for item in items if source.stem == safe_stem(f"{prefix}_{item.get('id')}")), {})
+                    if matching:
+                        validate_metadata(probe(source, tools, work), matching)
                     stem = source.stem
                     if prefix in {"DY", "TT"}:
                         match = re.search(r"\d{8,}", stem)
                         stem = f"{prefix}_{match[0]}" if match else f"{prefix}_{stem}"
                     item = prepare_video(source, output, stem, tools, work, args.timeout)
                     report["files"].append(item)
-                    summary = {"source_url": normalized, "id": matching.get("id"), "title": matching.get("title"),
+                    summary = {"source_url": public_url(normalized), "id": matching.get("id"), "title": matching.get("title"),
                                "uploader": matching.get("uploader"), "verified_file": item}
                     write_json_exclusive(output / f"{stem}.info.json", summary)
                 if args.extras:
@@ -502,6 +569,12 @@ def execute_job(args, tools: Tools) -> dict:
             (work / "private_cookies.txt").unlink(missing_ok=True)
         except OSError as cookie_error:
             report["credential_cleanup_error"] = safe_error(str(cookie_error))
+        for log in work.iterdir():
+            if log.is_file() and re.fullmatch(r"[A-Za-z-]+_[0-9a-f]{8}\.(out|err)", log.name):
+                try:
+                    log.write_text(safe_error(log.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
+                except OSError as log_error:
+                    report.setdefault("log_redaction_errors", []).append(safe_error(str(log_error)))
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_json_exclusive(report_path, report)
     return report

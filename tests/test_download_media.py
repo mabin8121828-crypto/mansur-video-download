@@ -100,6 +100,7 @@ class CoreTests(unittest.TestCase):
         text = media.safe_error("failed https://example.com/video?token=secret\nCookie: secret_cookie")
         self.assertNotIn("secret", text)
         self.assertIn("[redacted]", text)
+        self.assertNotIn("synthetic-private-list", media.public_url("https://example.com/video?list=synthetic-private-list"))
 
     def test_safe_name_and_reserved_windows_names(self):
         self.assertEqual(media.safe_stem("a/b:c"), "a_b_c")
@@ -202,6 +203,16 @@ class MediaTests(unittest.TestCase):
         result = self.prepare()
         self.assertTrue(result["reused"])
         self.assertEqual(before, hashlib.sha256(path.read_bytes()).hexdigest())
+
+    def test_same_name_same_duration_different_source_is_conflict(self):
+        first = self.prepare()
+        original_hash = media.file_sha256(Path(first["path"]))
+        alternative = self.case / "different.mp4"
+        subprocess.run([self.tools.ffmpeg, "-nostdin", "-v", "error", "-i", str(self.compatible_source),
+            "-vf", "negate", "-c:v", "libx264", "-c:a", "copy", str(alternative)], check=True, timeout=30)
+        with self.assertRaisesRegex(media.WorkflowError, "different source"):
+            self.prepare(alternative)
+        self.assertEqual(media.file_sha256(Path(first["path"])), original_hash)
 
     def test_bad_existing_output_is_left_untouched(self):
         path = self.output / "test.mp4"
@@ -308,6 +319,83 @@ class MediaTests(unittest.TestCase):
                 arguments(output_dir=str(self.output)), self.tools, self.work, [])
         self.assertEqual(files, [self.output / "YT_test123.mp4"])
         self.assertEqual(runner.call_count, 1)
+
+    def test_cached_duration_and_resolution_match_platform_request(self):
+        self.prepare(name="YT_test123")
+        original_run = media.run
+        for changes in ({"duration": 120}, {"width": 640, "height": 480}):
+            with self.subTest(changes=changes):
+                def fake_metadata(command, stage, work, timeout):
+                    if stage == "metadata":
+                        return json.dumps({"id": "test123"} | changes)
+                    return original_run(command, stage, work, timeout)
+
+                with patch.object(media, "run", side_effect=fake_metadata), \
+                     patch.object(self.tools, "describe", return_value={}):
+                    result = media.execute_job(arguments(output_dir=str(self.output)), self.tools)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["stage"], "verify")
+
+    def test_saved_source_urls_hide_signed_query_values(self):
+        original_run = media.run
+
+        def fake_download(command, stage, work, timeout):
+            if stage == "metadata":
+                return '{"id":"test123"}'
+            if stage == "download":
+                destination = work / "VIDEO_test123.mp4"
+                shutil.copyfile(self.compatible_source, destination)
+                (work / "final_paths.jsonl").write_text(json.dumps(str(destination)) + "\n", encoding="utf-8")
+                return ""
+            return original_run(command, stage, work, timeout)
+
+        with patch.object(media, "run", side_effect=fake_download), patch.object(self.tools, "describe", return_value={}):
+            result = media.execute_job(arguments(output_dir=str(self.output),
+                url="https://example.com/video.mp4?token=synthetic-test-secret"), self.tools)
+        self.assertTrue(result["ok"], result)
+        for path in self.output.rglob("*.json"):
+            self.assertNotIn("synthetic-test-secret", path.read_text(encoding="utf-8"))
+        self.assertIn("%5Bredacted%5D", result["source_url"])
+
+    def test_existing_output_still_fetches_requested_extras(self):
+        first = self.prepare(name="YT_test123")
+        video_hash = media.file_sha256(Path(first["path"]))
+        original_run = media.run
+        stages = []
+
+        def fake_attachments(command, stage, work, timeout):
+            stages.append(stage)
+            if stage == "metadata":
+                return '{"id":"test123", "subtitles":{"en":[]}}'
+            if stage == "attachments":
+                self.assertIn("--skip-download", command)
+                (work / "YT_test123.en.srt").write_text("1\n00:00:00,000 --> 00:00:01,000\nTest\n", encoding="utf-8")
+                return ""
+            return original_run(command, stage, work, timeout)
+
+        with patch.object(media, "run", side_effect=fake_attachments), patch.object(self.tools, "describe", return_value={}):
+            result = media.execute_job(arguments(output_dir=str(self.output), extras=True), self.tools)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("attachments", stages)
+        self.assertNotIn("download", stages)
+        self.assertTrue((self.output / "YT_test123.en.srt").is_file())
+        self.assertEqual(media.file_sha256(Path(first["path"])), video_hash)
+
+    def test_failed_command_logs_redact_query_and_authorization(self):
+        command = [sys.executable, "-c", "import sys; print('https://example.com/v?token=synthetic-secret', file=sys.stderr); "
+                   "print('Authorization: Bearer synthetic-secret', file=sys.stderr); sys.exit(2)"]
+        original_run = media.run
+
+        def failing_metadata(args, stage, work, timeout):
+            if stage == "metadata":
+                return original_run(command, stage, work, timeout)
+            return original_run(args, stage, work, timeout)
+
+        with patch.object(media, "run", side_effect=failing_metadata), patch.object(self.tools, "describe", return_value={}):
+            result = media.execute_job(arguments(output_dir=str(self.output)), self.tools)
+        self.assertFalse(result["ok"])
+        for path in Path(result["retained_work_dir"]).glob("*.err"):
+            self.assertNotIn("synthetic-secret", path.read_text(encoding="utf-8"))
 
     def test_real_ytdlp_local_http_download_delivery(self):
         from functools import partial

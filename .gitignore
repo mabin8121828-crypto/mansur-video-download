@@ -20,5 +20,7 @@ logs/
 *.part
 *.ytdl
 *.log
+*.info.json
+*.source.json
 .DS_Store
 Thumbs.db

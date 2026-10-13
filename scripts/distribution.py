@@ -12,6 +12,7 @@ SKILL_FILES = (
 RELEASE_FILES = SKILL_FILES + (
     "README.md", "scripts/install_skill.py", "scripts/package_skill.py",
     "scripts/validate_skill.py", "scripts/distribution.py",
+    "requirements-dev.txt", "tests/test_download_media.py", "tests/test_distribution.py",
 )
 
 
