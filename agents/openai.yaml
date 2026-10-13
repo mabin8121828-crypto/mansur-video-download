@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mansur 视频下载"
+  short_description: "下载高清在线视频，转换 iPhone 兼容格式并完整验证"
+  default_prompt: "使用 $mansur-video-download 下载这个视频，输出兼容 iPhone 的 MP4，并检查整段视频。"
