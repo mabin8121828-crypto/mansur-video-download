@@ -4,7 +4,7 @@ description: "下载用户提供链接的在线视频，并交付经过完整解
 license: "MIT"
 metadata:
   author: "Mansur"
-  version: "0.1.0"
+  version: "0.1.1"
 ---
 
 # Mansur Video Download

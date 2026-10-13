@@ -4,7 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 NAME = "mansur-video-download"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 SKILL_FILES = (
     "SKILL.md", "agents/openai.yaml", "scripts/download_media.py",
     "references/troubleshooting.md", "requirements.txt", "LICENSE",

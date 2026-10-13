@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 import uuid
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 DEFAULT_OUTPUT = Path(os.environ.get("MANSUR_VIDEO_OUTPUT_DIR", str(Path.home() / "Downloads" / "MansurVideos")))
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts"}
 

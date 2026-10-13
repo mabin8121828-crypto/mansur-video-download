@@ -98,7 +98,7 @@ python scripts/package_skill.py
 
 测试使用生成的短视频和本机 HTTP 服务，不需要私人 Cookie 或网上视频。发布包使用固定文件清单生成，不把整个工作目录打包。GitHub Actions 在 Windows 与 Linux 运行回归检查；具体结果以仓库 Actions 页面为准。
 
-打包输出为 `dist/mansur-video-download-0.1.0.zip`，根目录包含 `mansur-video-download/SKILL.md`。
+打包输出为 `dist/mansur-video-download-0.1.1.zip`，根目录包含 `mansur-video-download/SKILL.md`。
 
 故障定位、环境覆盖与可选后端协议见 [references/troubleshooting.md](references/troubleshooting.md)。
 

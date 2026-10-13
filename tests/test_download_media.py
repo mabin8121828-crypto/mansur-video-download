@@ -317,7 +317,8 @@ class MediaTests(unittest.TestCase):
         with patch.object(media, "run", return_value='{"id":"test123"}') as runner:
             files, _ = media.download_ytdlp("https://youtube.com/watch?v=test123", "YT",
                 arguments(output_dir=str(self.output)), self.tools, self.work, [])
-        self.assertEqual(files, [self.output / "YT_test123.mp4"])
+        self.assertEqual(len(files), 1)
+        self.assertTrue(files[0].samefile(self.output / "YT_test123.mp4"))
         self.assertEqual(runner.call_count, 1)
 
     def test_cached_duration_and_resolution_match_platform_request(self):
